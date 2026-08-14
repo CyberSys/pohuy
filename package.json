@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Session-scoped Russian engineering response style for Pi",
   "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test extensions/pohuy.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [
     "pi-package"
   ],
@@ -10,13 +14,19 @@
     ".claude-plugin/",
     "commands/",
     "docs/",
-    "extensions/",
+    "extensions/pohuy.ts",
+    "extensions/README.md",
     "skills/",
     "ЧЕСТНЫЕ-ЦИФРЫ.md"
   ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
   },
   "pi": {
     "extensions": [

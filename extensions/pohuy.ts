@@ -1,8 +1,6 @@
 import {
-  formatSkillsForPrompt,
   getAgentDir,
   withFileMutationQueue,
-  type BuildSystemPromptOptions,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -20,7 +18,6 @@ import { dirname, join } from "node:path";
 
 type Tier = "lite" | "full" | "ultra";
 type StoredTier = Tier | "normal";
-type BasePromptMode = "default" | "minimal";
 type JsonObject = Record<string, unknown>;
 
 const SETTINGS_KEY = "pohuy";
@@ -46,13 +43,6 @@ const OPTIONAL_SKILL_SECTIONS = [
 ] as const;
 const SCENE_FRAMING =
   "Scene examples are tone references, not scripts. Never quote them verbatim; adapt them to the current situation.";
-const MINIMAL_BASE_PROMPT = `You are a capable general-purpose agent.
-
-Follow higher-priority and project-local instructions. Use available tools when they improve correctness, inspect relevant sources before making claims, and verify completed work when practical.
-
-Be precise, direct, and useful. Preserve technical identifiers, commands, error messages, and required output formats exactly. Ask for clarification only when the task cannot be completed safely from the available information.
-
-Treat the supplied tools, guidelines, context files, skills, and appended instructions as authoritative. Keep tool calls, structured output, code, and other machine-consumed content valid and separate from conversational prose.`;
 const DEFAULT_ULTRA_SCENES = [
   "Легаси-археология",
   "Каскадный отказ",
@@ -80,7 +70,6 @@ type SourcePreset = (typeof SOURCE_PRESET_VALUES)[number];
 type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 type StoredSettings = {
   tier: StoredTier;
-  basePrompt: BasePromptMode;
   selectedSections?: string[];
 };
 type SettingsItem = {
@@ -102,6 +91,14 @@ type StyleSource = {
   tiers: Record<Tier, string>;
   options: SourceOption[];
 };
+
+const WORKING_MINIMUM_OVERLAPS: Record<string, string> = {
+  [sourceId("slovar", "Состояния и статусы")]: "Состояние:",
+  [sourceId("slovar", "Действия")]: "Действия:",
+  [sourceId("slovar", "Оценки и количества")]: "Связки и оценки:",
+  [sourceId("slovar", "Сущности")]: "Сущности:",
+};
+const WORKING_MINIMUM_LABELS = [...Object.values(WORKING_MINIMUM_OVERLAPS), "Присказки"];
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -206,7 +203,7 @@ function extractTierPolicy(levels: string, tier: Tier): string {
   return [`## Уровень ${tier}`, tableRow, ...examples].join("\n\n");
 }
 
-async function loadStyleSource(): Promise<StyleSource> {
+export async function loadStyleSource(): Promise<StyleSource> {
   const [skill, slovar, scenes] = await Promise.all([
     readFile(SKILL_PATH, "utf8"),
     readFile(SLOVAR_PATH, "utf8"),
@@ -286,7 +283,7 @@ function normalizeStoredSettings(settings: StoredSettings, source: StyleSource):
 }
 
 function sameStoredSettings(left: StoredSettings, right: StoredSettings): boolean {
-  if (left.tier !== right.tier || left.basePrompt !== right.basePrompt) return false;
+  if (left.tier !== right.tier) return false;
   if (left.selectedSections === undefined || right.selectedSections === undefined) {
     return left.selectedSections === right.selectedSections;
   }
@@ -297,95 +294,178 @@ function sameStoredSettings(left: StoredSettings, right: StoredSettings): boolea
 function fullSettingsPatch(settings: StoredSettings): SettingsPatch {
   return {
     tier: settings.tier,
-    basePrompt: settings.basePrompt,
     selectedSections: settings.selectedSections === undefined ? null : settings.selectedSections,
   };
 }
 
-function buildStylePolicy(settings: StoredSettings, source: StyleSource): string | undefined {
-  if (settings.tier === "normal") return undefined;
+function removeWorkingMinimumOverlaps(content: string, selected: Set<string>): string {
+  const removedLabels = new Set(
+    Object.entries(WORKING_MINIMUM_OVERLAPS)
+      .filter(([id]) => selected.has(id))
+      .map(([, label]) => label),
+  );
+  if (removedLabels.size === 0) return content;
+
+  const lines = content.split("\n");
+  const result: string[] = [];
+  let skipping = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const label = WORKING_MINIMUM_LABELS.find((candidate) =>
+      candidate === "Присказки" ? trimmed.startsWith("Присказки") : trimmed === candidate
+    );
+    if (label) skipping = removedLabels.has(label);
+    if (!skipping) result.push(line);
+  }
+  return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function selectTierVariant(content: string, tier: Tier): string {
+  const lines = content.split("\n");
+  const result: string[] = [];
+  let skippingVariant = false;
+
+  for (const line of lines) {
+    const variant = line.match(/^- (lite|full|ultra):/);
+    if (variant) {
+      skippingVariant = variant[1] !== tier;
+      if (!skippingVariant) result.push(line);
+      continue;
+    }
+    if (skippingVariant && /^\s{2,}\S/.test(line)) continue;
+    skippingVariant = false;
+    result.push(line);
+  }
+  return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function compileSelectedOption(option: SourceOption, selected: Set<string>, tier: Tier): string {
+  let content = option.content;
+  if (option.id === sourceId("skill", "Словарь (рабочий минимум)")) {
+    content = removeWorkingMinimumOverlaps(content, selected);
+  }
+  return selectTierVariant(content, tier);
+}
+
+export function buildStylePolicy(settings: StoredSettings, source: StyleSource): string | undefined {
+  const tier = settings.tier;
+  if (tier === "normal") return undefined;
   const selected = new Set(effectiveSectionIds(settings, source));
   return [
     ...source.common,
-    ...source.options.filter((option) => selected.has(option.id)).map((option) => option.content),
-    source.tiers[settings.tier],
-  ].join("\n\n");
+    ...source.options
+      .filter((option) => selected.has(option.id))
+      .map((option) => compileSelectedOption(option, selected, tier)),
+    source.tiers[tier],
+  ].filter(Boolean).join("\n\n");
 }
 
 function managedStyleBlock(stylePrompt: string | undefined): string | undefined {
   return stylePrompt ? `${PROMPT_START}\n${stylePrompt}\n${PROMPT_END}` : undefined;
 }
 
-function placeStylePromptAtAppendBoundary(
+export function stripManagedStyleBlocks(prompt: string): string {
+  const openStarts: number[] = [];
+  const ranges: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+
+  while (cursor < prompt.length) {
+    const start = prompt.indexOf(PROMPT_START, cursor);
+    const end = prompt.indexOf(PROMPT_END, cursor);
+    if (start === -1 && end === -1) break;
+
+    if (start !== -1 && (end === -1 || start < end)) {
+      openStarts.push(start);
+      cursor = start + PROMPT_START.length;
+      continue;
+    }
+
+    if (openStarts.length > 0) {
+      ranges.push({
+        start: openStarts.pop()!,
+        end: end + PROMPT_END.length,
+      });
+    }
+    cursor = end + PROMPT_END.length;
+  }
+
+  if (ranges.length === 0) return prompt;
+
+  const merged = ranges
+    .sort((left, right) => left.start - right.start)
+    .reduce<Array<{ start: number; end: number }>>((result, range) => {
+      const previous = result.at(-1);
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        result.push({ ...range });
+      }
+      return result;
+    }, []);
+  const expanded = merged
+    .map((range) => {
+      let { start, end } = range;
+      while (start > 0 && prompt[start - 1] === "\n") start -= 1;
+      while (end < prompt.length && prompt[end] === "\n") end += 1;
+      return { start, end };
+    })
+    .reduce<Array<{ start: number; end: number }>>((result, range) => {
+      const previous = result.at(-1);
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        result.push({ ...range });
+      }
+      return result;
+    }, []);
+
+  let result = "";
+  cursor = 0;
+  for (const range of expanded) {
+    result += prompt.slice(cursor, range.start);
+    if (result.length > 0 && range.end < prompt.length) result += "\n\n";
+    cursor = range.end;
+  }
+  result += prompt.slice(cursor);
+  return result;
+}
+
+export function placeStylePromptAtAppendBoundary(
   basePrompt: string,
   appendSystemPrompt: string | undefined,
   stylePrompt: string | undefined,
 ): string {
+  const cleanBase = stripManagedStyleBlocks(basePrompt);
   const block = managedStyleBlock(stylePrompt);
-  if (!block) return basePrompt;
+  if (!block) return cleanBase;
 
   const append = appendSystemPrompt?.trim();
-  const appendIndex = append ? basePrompt.lastIndexOf(append) : -1;
+  const appendIndex = append ? cleanBase.lastIndexOf(append) : -1;
   if (append && appendIndex >= 0) {
-    const before = basePrompt.slice(0, appendIndex).replace(/\n+$/, "");
-    const after = basePrompt.slice(appendIndex).replace(/^\n+/, "");
+    const before = cleanBase.slice(0, appendIndex).replace(/\n+$/, "");
+    const after = cleanBase.slice(appendIndex).replace(/^\n+/, "");
     return [before, block, after].filter(Boolean).join("\n\n");
   }
-  return basePrompt ? `${basePrompt}\n\n${block}` : block;
-}
-
-function renderMinimalSystemPrompt(
-  options: BuildSystemPromptOptions,
-  stylePrompt: string | undefined,
-): string {
-  const parts = [options.customPrompt?.trim() || MINIMAL_BASE_PROMPT];
-  const tools = (options.selectedTools ?? Object.keys(options.toolSnippets ?? {}))
-    .filter((name) => options.toolSnippets?.[name])
-    .map((name) => `- ${name}: ${options.toolSnippets?.[name]}`);
-  if (tools.length > 0) parts.push(`Available tools:\n${tools.join("\n")}`);
-
-  const guidelines = (options.promptGuidelines ?? [])
-    .map((guideline) => guideline.trim())
-    .filter(Boolean)
-    .map((guideline) => `- ${guideline}`);
-  if (guidelines.length > 0) parts.push(`Guidelines:\n${guidelines.join("\n")}`);
-
-  for (const file of options.contextFiles ?? []) {
-    parts.push(`## ${file.path}\n\n${file.content}`);
-  }
-  if (options.skills && options.skills.length > 0) {
-    const skills = formatSkillsForPrompt(options.skills);
-    if (skills.trim()) parts.push(skills);
-  }
-  parts.push(`Current working directory: ${options.cwd}`);
-
-  const block = managedStyleBlock(stylePrompt);
-  if (block) parts.push(block);
-  const append = options.appendSystemPrompt?.trim();
-  if (append) parts.push(append);
-  return parts.join("\n\n");
+  return cleanBase ? `${cleanBase}\n\n${block}` : block;
 }
 
 async function readStoredSettings(): Promise<StoredSettings> {
   try {
     const root: unknown = JSON.parse(await readFile(SETTINGS_PATH, "utf8"));
     if (!isJsonObject(root) || !isJsonObject(root[SETTINGS_KEY])) {
-      return { tier: "normal", basePrompt: "default" };
+      return { tier: "normal" };
     }
 
     const record = root[SETTINGS_KEY];
     const rawTier = record.tier;
     const tier = rawTier === "normal" || isTier(rawTier) ? rawTier : "normal";
-    const basePrompt = record.basePrompt === "minimal" ? "minimal" : "default";
     const selectedSections = Array.isArray(record.selectedSections)
       ? [...new Set(record.selectedSections.filter((value): value is string => typeof value === "string"))]
       : undefined;
-    return selectedSections === undefined
-      ? { tier, basePrompt }
-      : { tier, basePrompt, selectedSections };
+    return selectedSections === undefined ? { tier } : { tier, selectedSections };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) {
-      return { tier: "normal", basePrompt: "default" };
+      return { tier: "normal" };
     }
     throw error;
   }
@@ -393,7 +473,6 @@ async function readStoredSettings(): Promise<StoredSettings> {
 
 type SettingsPatch = {
   tier?: StoredTier;
-  basePrompt?: BasePromptMode;
   selectedSections?: string[] | null;
 };
 
@@ -401,7 +480,6 @@ function applySettingsPatch(settings: StoredSettings, patch: SettingsPatch): Sto
   const next: StoredSettings = {
     ...settings,
     tier: patch.tier ?? settings.tier,
-    basePrompt: patch.basePrompt ?? settings.basePrompt,
   };
   if (patch.selectedSections === null) {
     delete next.selectedSections;
@@ -433,13 +511,6 @@ function buildSettingsItems(
         description: "Response style and default source selection.",
         currentValue: settings.tier,
         values: ["normal", ...TIERS],
-      },
-      {
-        id: "basePrompt",
-        label: "Base prompt",
-        description: "Keep Pi's default coding prompt or replace it with a compact general-purpose prompt.",
-        currentValue: settings.basePrompt,
-        values: ["default", "minimal"],
       },
       {
         id: "sourcePreset",
@@ -587,9 +658,9 @@ function renderHelpLine(
   theme: ExtensionContext["ui"]["theme"],
 ): string {
   return line
-    .split(/(Enter\/Space|Tab\/Shift\+Tab|Esc)/)
+    .split(/(Enter\/Space|Tab or reverse Tab|Esc)/)
     .map((part) =>
-      /^(Enter\/Space|Tab\/Shift\+Tab|Esc)$/.test(part)
+      /^(Enter\/Space|Tab or reverse Tab|Esc)$/.test(part)
         ? theme.fg("accent", theme.bold(part))
         : theme.fg("dim", part)
     )
@@ -612,7 +683,7 @@ function renderResponsiveSettings(
     ? wrapToWidth(description, Math.max(1, width - 4))
     : [];
   const helpLines = wrapToWidth(
-    "Enter/Space to change · Tab/Shift+Tab to switch sections · Esc to close",
+    "Enter/Space to change / Tab or reverse Tab to switch sections / Esc to close",
     Math.max(1, width - 2),
   );
   const contentHeight = Math.max(1, height - 4);
@@ -677,6 +748,25 @@ function renderResponsiveSettings(
   return lines;
 }
 
+export function fitSettingsRender(lines: string[], width: number, height: number): string[] {
+  const safeWidth = Math.max(0, width);
+  const safeHeight = Math.max(0, height);
+  return lines
+    .slice(0, safeHeight)
+    .map((line) => truncateToWidth(line, safeWidth, ""));
+}
+
+export function mergeStoredSettings(root: JsonObject, patch: SettingsPatch): JsonObject {
+  const current = isJsonObject(root[SETTINGS_KEY]) ? { ...root[SETTINGS_KEY] } : {};
+  if (patch.tier !== undefined) current.tier = patch.tier;
+  if (patch.selectedSections === null) {
+    delete current.selectedSections;
+  } else if (patch.selectedSections !== undefined) {
+    current.selectedSections = [...new Set(patch.selectedSections)];
+  }
+  return { ...root, [SETTINGS_KEY]: current };
+}
+
 async function saveStoredSettings(patch: SettingsPatch): Promise<void> {
   await withFileMutationQueue(SETTINGS_PATH, async () => {
     await mkdir(dirname(SETTINGS_PATH), { recursive: true });
@@ -705,20 +795,12 @@ async function saveStoredSettings(patch: SettingsPatch): Promise<void> {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
 
-    const current = isJsonObject(root[SETTINGS_KEY]) ? { ...root[SETTINGS_KEY] } : {};
-    if (patch.tier !== undefined) current.tier = patch.tier;
-    if (patch.basePrompt !== undefined) current.basePrompt = patch.basePrompt;
-    if (patch.selectedSections === null) {
-      delete current.selectedSections;
-    } else if (patch.selectedSections !== undefined) {
-      current.selectedSections = [...new Set(patch.selectedSections)];
-    }
-
+    const nextRoot = mergeStoredSettings(root, patch);
     const temporary = `${SETTINGS_PATH}.${process.pid}.${randomUUID()}.tmp`;
     try {
       const handle = await open(temporary, "wx", mode);
       try {
-        await handle.writeFile(`${JSON.stringify({ ...root, [SETTINGS_KEY]: current }, null, 2)}\n`, "utf8");
+        await handle.writeFile(`${JSON.stringify(nextRoot, null, 2)}\n`, "utf8");
         await handle.sync();
       } finally {
         await handle.close();
@@ -733,7 +815,7 @@ async function saveStoredSettings(patch: SettingsPatch): Promise<void> {
 
 export default async function pohuyExtension(pi: ExtensionAPI) {
   let styleSource: StyleSource | undefined;
-  let settings: StoredSettings = { tier: "normal", basePrompt: "default" };
+  let settings: StoredSettings = { tier: "normal" };
   let settingsQueue: Promise<void> = Promise.resolve();
 
   const enqueueSettingsOperation = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -814,14 +896,14 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
           return;
         }
         const source = styleSource;
-        const mode = (ctx as typeof ctx & { mode?: string }).mode;
-        if (!ctx.hasUI || (mode !== undefined && mode !== "tui")) {
+        if (!ctx.hasUI || ctx.mode !== "tui") {
           if (ctx.hasUI) ctx.ui.notify("Pohuy settings UI is available only in TUI mode.", "warning");
           return;
         }
 
         await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
           let applying = false;
+          let closeRequested = false;
           let activeSection: SettingsSection = "general";
           const selectedIndexes: Record<SettingsSection, number> = {
             general: 0,
@@ -855,9 +937,6 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
             if (item.id === "tier" && (newValue === "normal" || isTier(newValue))) {
               patch = { tier: newValue };
               notification = `Pohuy mode: ${newValue}`;
-            } else if (item.id === "basePrompt" && (newValue === "default" || newValue === "minimal")) {
-              patch = { basePrompt: newValue };
-              notification = `Pohuy base prompt: ${newValue}`;
             } else if (
               item.id === "sourcePreset" &&
               SOURCE_PRESET_VALUES.includes(newValue as SourcePreset)
@@ -890,14 +969,16 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
               })
               .finally(() => {
                 applying = false;
-                tui.requestRender();
+                if (closeRequested) done(undefined);
+                else tui.requestRender();
               });
           };
 
           return {
             render(width: number) {
+              const height = tui.terminal.rows;
               const border = theme.fg("border", "─".repeat(Math.max(0, width)));
-              return [
+              return fitSettingsRender([
                 border,
                 renderSettingsTabs(activeSection, theme, width),
                 border,
@@ -905,14 +986,20 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
                   currentItems(),
                   selectedIndexes[activeSection],
                   width,
-                  tui.terminal.rows,
+                  height,
                   theme,
                 ),
                 border,
-              ].map((line) => truncateToWidth(line, width, ""));
+              ], width, height);
             },
             invalidate() {},
             handleInput(data: string) {
+              if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+                if (applying) closeRequested = true;
+                else done(undefined);
+                return;
+              }
+              if (applying || closeRequested) return;
               if (matchesKey(data, Key.tab)) {
                 switchSection("forward");
                 return;
@@ -935,9 +1022,6 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
                 selectedIndexes[activeSection] = Math.max(0, items.length - 1);
               } else if (matchesKey(data, Key.enter) || matchesKey(data, Key.space)) {
                 applyCurrentSetting();
-                return;
-              } else if (matchesKey(data, Key.escape)) {
-                done(undefined);
                 return;
               } else {
                 return;
@@ -993,7 +1077,7 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify(`Could not save Pohuy settings: ${String(error)}`, "error");
     }
 
-    return { action: "continue" };
+    return { action: "handled" };
   });
 
   pi.on("before_agent_start", (event) => {
@@ -1007,18 +1091,12 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
       ].join("\n\n")
       : undefined;
 
-    if (settings.basePrompt === "minimal") {
-      return {
-        systemPrompt: renderMinimalSystemPrompt(event.systemPromptOptions, stylePrompt),
-      };
-    }
-    if (!stylePrompt) return;
-    return {
-      systemPrompt: placeStylePromptAtAppendBoundary(
-        event.systemPrompt,
-        event.systemPromptOptions.appendSystemPrompt,
-        stylePrompt,
-      ),
-    };
+    const systemPrompt = placeStylePromptAtAppendBoundary(
+      event.systemPrompt,
+      event.systemPromptOptions.appendSystemPrompt,
+      stylePrompt,
+    );
+    if (systemPrompt === event.systemPrompt) return;
+    return { systemPrompt };
   });
 }
