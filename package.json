@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Session-scoped Russian engineering response style for Pi",
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "test": "node --import tsx --test extensions/pohuy.test.ts",
     "typecheck": "tsc --noEmit"

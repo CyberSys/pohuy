@@ -320,20 +320,33 @@ function removeWorkingMinimumOverlaps(content: string, selected: Set<string>): s
   return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function selectTierVariant(content: string, tier: Tier): string {
+export function selectTierVariant(content: string, tier: Tier): string {
   const lines = content.split("\n");
   const result: string[] = [];
   let skippingVariant = false;
+  let pendingBlankLines: string[] = [];
 
   for (const line of lines) {
     const variant = line.match(/^- (lite|full|ultra):/);
     if (variant) {
+      pendingBlankLines = [];
       skippingVariant = variant[1] !== tier;
       if (!skippingVariant) result.push(line);
       continue;
     }
-    if (skippingVariant && /^\s{2,}\S/.test(line)) continue;
-    skippingVariant = false;
+    if (skippingVariant) {
+      if (line.trim() === "") {
+        pendingBlankLines.push(line);
+        continue;
+      }
+      if (/^\s{2,}\S/.test(line)) {
+        pendingBlankLines = [];
+        continue;
+      }
+      result.push(...pendingBlankLines);
+      pendingBlankLines = [];
+      skippingVariant = false;
+    }
     result.push(line);
   }
   return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();

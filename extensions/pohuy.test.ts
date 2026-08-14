@@ -7,6 +7,7 @@ import {
   loadStyleSource,
   mergeStoredSettings,
   placeStylePromptAtAppendBoundary,
+  selectTierVariant,
   stripManagedStyleBlocks,
 } from "./pohuy.js";
 
@@ -122,6 +123,36 @@ test("reported full configuration removes only known overlaps and inactive tier 
   assert.match(policy, /^- full: «Опизденеть можно:/m);
   assert.match(policy, /### Триумф после долгого дебага/);
   assert.match(policy, /таймзона в CI/);
+});
+
+test("keeps skipping an inactive tier variant across blank continuation lines", () => {
+  const content = [
+    "### Scene",
+    "- lite: hidden opening",
+    "  hidden continuation",
+    "",
+    "  hidden continuation after blank line",
+    "- full: visible example",
+    "",
+    "Following paragraph",
+  ].join("\n");
+
+  assert.equal(
+    selectTierVariant(content, "full"),
+    ["### Scene", "- full: visible example", "", "Following paragraph"].join("\n"),
+  );
+
+  const trailingInactiveVariant = [
+    "### Scene",
+    "- lite: visible example",
+    "- full: hidden example",
+    "",
+    "Following paragraph",
+  ].join("\n");
+  assert.equal(
+    selectTierVariant(trailingInactiveVariant, "lite"),
+    ["### Scene", "- lite: visible example", "", "Following paragraph"].join("\n"),
+  );
 });
 
 test("preserves unrelated root and legacy Pohuy settings fields", () => {
