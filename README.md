@@ -411,6 +411,7 @@ pi install git:github.com/smixs/pohuy
 - [@maloun](https://github.com/maloun) — «пиздарики», «ахуеть», «хуегрыз», «скибидык пиздык», «пук среньк» ([#16](https://github.com/smixs/pohuy/issues/16))
 - [@ByteCorn](https://github.com/ByteCorn) — семиотический корпус народных поговорок ([#14](https://github.com/smixs/pohuy/issues/14))
 - [@AdamsGH](https://github.com/AdamsGH) — нативное расширение для Pi ([#15](https://github.com/smixs/pohuy/pull/15))
+- [@akme](https://github.com/akme) — «ебать-копать» ([#16](https://github.com/smixs/pohuy/issues/16))
 
 Не хватает рабочей фразы — заноси в [issues](https://github.com/smixs/pohuy/issues).
 
