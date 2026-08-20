@@ -1,3 +1,5 @@
 .DS_Store
 implementation-notes.md
+node_modules/
+.pi/
 pohuy-workspace/
