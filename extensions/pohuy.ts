@@ -43,6 +43,7 @@ const CORE_SKILL_SECTIONS = [
 ] as const;
 const OPTIONAL_SKILL_SECTIONS = [
   "Словарь (рабочий минимум)",
+  "Хуенитивы",
 ] as const;
 const SCENE_FRAMING =
   "Scene examples are tone references, not scripts. Never quote them verbatim; adapt them to the current situation.";
