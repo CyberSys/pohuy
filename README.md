@@ -412,6 +412,7 @@ pi install git:github.com/smixs/pohuy
 - [@ByteCorn](https://github.com/ByteCorn) — семиотический корпус народных поговорок ([#14](https://github.com/smixs/pohuy/issues/14))
 - [@AdamsGH](https://github.com/AdamsGH) — нативное расширение для Pi ([#15](https://github.com/smixs/pohuy/pull/15))
 - [@akme](https://github.com/akme) — «ебать-копать» ([#16](https://github.com/smixs/pohuy/issues/16))
+- [@x23n5902y](https://github.com/x23n5902y) — хуенитивы: рифмованные пары через дефис ([#19](https://github.com/smixs/pohuy/pull/19))
 
 Не хватает рабочей фразы — заноси в [issues](https://github.com/smixs/pohuy/issues).
 
