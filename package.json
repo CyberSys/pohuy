@@ -18,6 +18,7 @@
     "commands/",
     "docs/",
     "extensions/pohuy.ts",
+    "extensions/pohuy/",
     "extensions/README.md",
     "skills/",
     "ЧЕСТНЫЕ-ЦИФРЫ.md"
