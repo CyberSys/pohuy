@@ -17,6 +17,7 @@ import {
   selectTierVariant,
   stripManagedStyleBlocks,
 } from "./pohuy.js";
+import { SETTINGS_PATH } from "./pohuy/settings-store.js";
 
 const START = "<!-- POHUY:START -->";
 const END = "<!-- POHUY:END -->";
@@ -47,24 +48,29 @@ test("removes the managed block when normal mode is selected", () => {
   assert.equal(placeStylePromptAtAppendBoundary(base, "Append", undefined), "Base\n\nAppend");
 });
 
-test("leaves unmatched project text intact", () => {
-  const base = `Base\n\n${START}\nunterminated project text`;
+test("removes an unterminated managed block", () => {
+  const base = `Base\n\n${START}\nunterminated policy`;
 
-  assert.equal(stripManagedStyleBlocks(base), base);
+  assert.equal(stripManagedStyleBlocks(base), "Base");
 });
 
-test("preserves malformed marker text before a later completed block", () => {
+test("removes nested malformed and completed managed blocks", () => {
   const base = [
     "Base",
-    `${START}\nunterminated project text`,
+    `${START}\nunterminated policy`,
     `${START}\nmanaged policy\n${END}`,
     "Append",
   ].join("\n\n");
 
-  assert.equal(
-    stripManagedStyleBlocks(base),
-    ["Base", `${START}\nunterminated project text`, "Append"].join("\n\n"),
-  );
+  assert.equal(stripManagedStyleBlocks(base), "Base");
+});
+
+test("preserves the append boundary while replacing an unterminated managed block", () => {
+  const base = ["Base", `${START}\nunterminated policy`, "User append"].join("\n\n");
+
+  const result = placeStylePromptAtAppendBoundary(base, "User append", "current policy");
+
+  assert.equal(result, ["Base", `${START}\ncurrent policy\n${END}`, "User append"].join("\n\n"));
 });
 
 test("does not reformat prompts without completed managed blocks", () => {
@@ -161,23 +167,27 @@ test("a dictionary entry keeps its exact source path and can be disabled alone",
   assert.match(policy, /хуйня-муйня/);
 });
 
-test("an explicitly disabled dictionary term is removed from every compiled source", async () => {
+test("an explicitly disabled term removes matching entries without altering unrelated prose", async () => {
   const source = await loadStyleSource();
-  const entries = (nodes: typeof source.roots.skill): typeof source.roots.skill =>
+  const entries = (nodes: typeof source.roots.dictionary): typeof source.roots.dictionary =>
     nodes.flatMap((node) => [node, ...entries(node.children)]);
-  const item = entries(source.roots.skill).find((node) => node.label === "пиздрик");
+  const item = entries(source.roots.dictionary).find((node) => node.label === "ебашит");
   assert.ok(item);
 
   const policy = buildStylePolicy({
-    tier: "ultra",
-    selectedSections: source.options.map((option) => option.id),
+    tier: "full",
+    selectedSections: [
+      "skill:Словарь (рабочий минимум)",
+      "slovar:Состояния и статусы",
+      "sceny:1. Триумф — взлетело лучше, чем ждали",
+    ],
     itemOverrides: { [item.id]: false },
   }, source);
 
   assert.ok(policy);
-  assert.doesNotMatch(policy, /пиздрик/iu);
-  assert.match(policy, /хуйня вопрос/iu);
-  assert.match(policy, /хуяк/iu);
+  assert.doesNotMatch(policy, /^- (?:\*\*)?ебашит(?:\*\*)?\s+—/imu);
+  assert.match(policy, /Ебашит так, что алерты от скуки уснули\./u);
+  assert.match(policy, /Триумф — лучше, чем ждали \| охуенно, опизденеть можно, ебашит,/u);
 });
 
 test("disabling the style component preserves source selections", async () => {
@@ -256,6 +266,7 @@ test("prompt report measures the exact managed Pohuy block", async () => {
   assert.ok(stylePrompt);
   assert.equal(report.stylePrompt, stylePrompt);
   assert.equal(report.managedBlock, `${START}\n${stylePrompt}\n${END}`);
+  assert.ok(report.managedBlock);
   assert.equal(report.managedCharacters, report.managedBlock.length);
   assert.equal(report.policyCharacters, buildStylePolicy(settings, source)?.length);
   assert.ok(report.managedCharacters > report.policyCharacters);
@@ -386,7 +397,7 @@ test("settings navigation keeps Tab inside the current section and uses availabl
     ["СОСТОЯНИЕ", "включено"],
     ["ИСТОЧНИК", "settings.json"],
     ["ЧТО ДЕЛАЕТ", "normal"],
-    ["ЗАГРУЖЕНО ИЗ", "/home/adams/.pi/agent/settings.json"],
+    ["ЗАГРУЖЕНО ИЗ", SETTINGS_PATH],
   ].map(([label, value]) => initialDetail.find((line) => line.includes(label))?.indexOf(value));
   assert.deepEqual([...new Set(metadataValueColumns)], [14]);
 
@@ -665,8 +676,9 @@ test("Space toggles a nested dictionary group while the detail panel is focused"
   component.handleInput("l");
   component.handleInput("l");
   const firstChildSelected = component.render(170);
-  const firstChildList = firstChildSelected.slice(5, -3).map((line) => line.split("│")[1] ?? "").join("\n");
-  assert.match(firstChildList, new RegExp(`→ .*${stateGroup.children[0].label}`));
+  const firstChildLines = firstChildSelected.slice(5, -3).map((line) => line.split("│")[1] ?? "");
+  const firstChildLine = firstChildLines.find((line) => line.includes(stateGroup.children[0].label));
+  assert.ok(firstChildLine?.includes("→"));
 
   component.handleInput("]");
   component.handleInput("/");

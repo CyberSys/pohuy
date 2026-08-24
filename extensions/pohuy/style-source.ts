@@ -685,38 +685,32 @@ export function entryEnabled(node: ConfigNode, settings: StoredSettings, source:
   return inheritedEntryEnabled(node, settings, source);
 }
 
-function explicitlyDisabledTerms(settings: StoredSettings, source: StyleSource): string[] {
+function explicitlyDisabledTerms(settings: StoredSettings, source: StyleSource): Set<string> {
   const entries = flattenNodes([
     ...source.roots.skill,
     ...source.roots.dictionary,
-    ...source.roots.scenes,
   ]).filter((node) => node.kind === "entry" && settings.itemOverrides?.[node.id] === false);
-  return [...new Set(entries.flatMap((entry) => [entry.label, ...entry.aliases]).filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
+  return new Set(
+    entries.flatMap((entry) => [entry.label, ...entry.aliases])
+      .filter(Boolean)
+      .map((term) => term.toLocaleLowerCase("ru")),
+  );
 }
 
-function removeExplicitlyDisabledTerms(policy: string, settings: StoredSettings, source: StyleSource): string {
-  let filtered = policy;
-  for (const term of explicitlyDisabledTerms(settings, source)) {
-    const escaped = term.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-    filtered = filtered.replace(new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "giu"), "");
-  }
-  return filtered
-    .replace(/,\s*,/gu, ",")
-    .replace(/[ \t]+([,.;:])/gu, "$1")
-    .replace(/«\s*»/gu, "")
-    .replace(/\n{3,}/gu, "\n\n")
-    .trim();
+function matchesExplicitlyDisabledTerm(node: ConfigNode, disabledTerms: Set<string>): boolean {
+  return [node.label, ...node.aliases].some((term) => disabledTerms.has(term.toLocaleLowerCase("ru")));
 }
 
 function compileListOption(
   option: SourceOption,
   settings: StoredSettings,
   source: StyleSource,
+  disabledTerms: Set<string>,
 ): string | undefined {
   const root = option.nodes[0];
   if (!root) return option.content;
-  const enabled = (node: ConfigNode) => entryEnabled(node, settings, source);
+  const enabled = (node: ConfigNode) =>
+    entryEnabled(node, settings, source) && !matchesExplicitlyDisabledTerm(node, disabledTerms);
   const enabledEntries = flattenNodes([root]).filter((node) => node.kind === "entry" && enabled(node));
   if (enabledEntries.length === 0) return undefined;
 
@@ -746,20 +740,21 @@ export function buildStylePolicy(settings: StoredSettings, source: StyleSource):
   const tier = settings.tier;
   if (tier === "normal" || settings.skillEnabled === false) return undefined;
   const selected = new Set(effectiveSectionIds(settings, source));
+  const disabledTerms = explicitlyDisabledTerms(settings, source);
   const policy = [
     ...source.common,
     ...source.options.map((option) => {
-      if (option.section === "dictionary") return compileListOption(option, settings, source);
+      if (option.section === "dictionary") return compileListOption(option, settings, source, disabledTerms);
       const hasEntries = flattenNodes(option.nodes).some((node) => node.kind === "entry");
       if (option.section === "skill" && hasEntries) {
-        const compiled = compileListOption(option, settings, source);
+        const compiled = compileListOption(option, settings, source, disabledTerms);
         return compiled ? removeWorkingMinimumOverlaps(compiled, selected) : undefined;
       }
       return selected.has(option.id) ? compileSelectedOption(option, selected, tier) : undefined;
     }),
     source.tiers[tier],
   ].filter(Boolean).join("\n\n");
-  return removeExplicitlyDisabledTerms(policy, settings, source);
+  return policy;
 }
 
 const STYLE_PROMPT_LEAD =
@@ -849,6 +844,7 @@ export function stripManagedStyleBlocks(prompt: string): string {
     cursor = end + PROMPT_END.length;
   }
 
+  for (const start of openStarts) ranges.push({ start, end: prompt.length });
   if (ranges.length === 0) return prompt;
 
   const merged = ranges
@@ -895,17 +891,21 @@ export function placeStylePromptAtAppendBoundary(
   appendSystemPrompt: string | undefined,
   stylePrompt: string | undefined,
 ): string {
-  const cleanBase = stripManagedStyleBlocks(basePrompt);
   const block = managedStyleBlock(stylePrompt);
-  if (!block) return cleanBase;
-
   const append = appendSystemPrompt?.trim();
-  const appendIndex = append ? cleanBase.lastIndexOf(append) : -1;
+  const appendIndex = append ? basePrompt.lastIndexOf(append) : -1;
   if (append && appendIndex >= 0) {
-    const before = cleanBase.slice(0, appendIndex).replace(/\n+$/, "");
-    const after = cleanBase.slice(appendIndex).replace(/^\n+/, "");
+    const originalBefore = basePrompt.slice(0, appendIndex);
+    const cleanBefore = stripManagedStyleBlocks(originalBefore);
+    if (!block && cleanBefore === originalBefore) return basePrompt;
+
+    const before = cleanBefore.replace(/\n+$/, "");
+    const after = basePrompt.slice(appendIndex).replace(/^\n+/, "");
     return [before, block, after].filter(Boolean).join("\n\n");
   }
+
+  const cleanBase = stripManagedStyleBlocks(basePrompt);
+  if (!block) return cleanBase;
   return cleanBase ? `${cleanBase}\n\n${block}` : block;
 }
 
