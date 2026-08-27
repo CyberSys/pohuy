@@ -73,6 +73,14 @@ test("preserves the append boundary while replacing an unterminated managed bloc
   assert.equal(result, ["Base", `${START}\ncurrent policy\n${END}`, "User append"].join("\n\n"));
 });
 
+test("ignores append text that appears only inside the base prompt", () => {
+  const base = "Base mentions User append inside its main instruction.\n\nUnmanaged tail";
+
+  const result = placeStylePromptAtAppendBoundary(base, "User append", "current policy");
+
+  assert.equal(result, [base, `${START}\ncurrent policy\n${END}`].join("\n\n"));
+});
+
 test("does not reformat prompts without completed managed blocks", () => {
   const base = "  Base with spaces  \n\n\nUnmanaged tail  ";
 

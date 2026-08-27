@@ -893,7 +893,11 @@ export function placeStylePromptAtAppendBoundary(
 ): string {
   const block = managedStyleBlock(stylePrompt);
   const append = appendSystemPrompt?.trim();
-  const appendIndex = append ? basePrompt.lastIndexOf(append) : -1;
+  const trimmedBase = basePrompt.trimEnd();
+  const appendIndex =
+    append && (trimmedBase === append || trimmedBase.endsWith(`\n${append}`))
+      ? trimmedBase.length - append.length
+      : -1;
   if (append && appendIndex >= 0) {
     const originalBefore = basePrompt.slice(0, appendIndex);
     const cleanBefore = stripManagedStyleBlocks(originalBefore);
