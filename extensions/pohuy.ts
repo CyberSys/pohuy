@@ -1,831 +1,42 @@
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { createStyleSettingsComponent } from "./pohuy/settings-ui.js";
 import {
-  getAgentDir,
-  withFileMutationQueue,
-  type ExtensionAPI,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+  applySettingsPatch,
+  diffStoredSettings,
+  readStoredSettings,
+  saveStoredSettings,
+} from "./pohuy/settings-store.js";
 import {
-  type AutocompleteItem,
-  Key,
-  matchesKey,
-  truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
-import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+  buildStylePrompt,
+  isTier,
+  loadStyleSource,
+  normalizeStoredSettings,
+  placeStylePromptAtAppendBoundary,
+  sameStoredSettings,
+  TIERS,
+  type SettingsPatch,
+  type StoredSettings,
+  type StoredTier,
+  type StyleSource,
+} from "./pohuy/style-source.js";
 
-type Tier = "lite" | "full" | "ultra";
-type StoredTier = Tier | "normal";
-type JsonObject = Record<string, unknown>;
+export {
+  buildStylePolicy,
+  buildStylePrompt,
+  buildStylePromptReport,
+  loadStyleSource,
+  normalizeStoredSettings,
+  placeStylePromptAtAppendBoundary,
+  selectTierVariant,
+  stripManagedStyleBlocks,
+} from "./pohuy/style-source.js";
+export { diffStoredSettings, fitSettingsRender, mergeStoredSettings } from "./pohuy/settings-store.js";
+export { createStyleSettingsComponent } from "./pohuy/settings-ui.js";
 
-const SETTINGS_KEY = "pohuy";
-const SETTINGS_PATH = join(getAgentDir(), "settings.json");
-const TIERS = ["lite", "full", "ultra"] as const;
-const USAGE = "Use /pohuy, /pohuy lite, /pohuy full, /pohuy ultra, or /pohuy normal.";
-const PROMPT_START = "<!-- POHUY:START -->";
-const PROMPT_END = "<!-- POHUY:END -->";
+const USAGE = "Используйте /pohuy, /pohuy lite, /pohuy full, /pohuy ultra или /pohuy normal.";
 const ENABLE_PHRASES = new Set(["та мне похуй", "заебал"]);
 const DISABLE_PHRASES = new Set(["нормальный режим", "хватит материться"]);
-const SKILL_PATH = new URL("../skills/pohuy/SKILL.md", import.meta.url);
-const SLOVAR_PATH = new URL("../skills/pohuy/references/slovar.md", import.meta.url);
-const SCENES_PATH = new URL("../skills/pohuy/references/sceny.md", import.meta.url);
-const CORE_SKILL_SECTIONS = [
-  "Persistence",
-  "Правила",
-  "Шкала состояний проекта",
-  "Auto-Clarity (мат выключается)",
-  "Boundaries",
-] as const;
-const OPTIONAL_SKILL_SECTIONS = [
-  "Словарь (рабочий минимум)",
-  "Хуенитивы",
-] as const;
-const SCENE_FRAMING =
-  "Scene examples are tone references, not scripts. Never quote them verbatim; adapt them to the current situation.";
-const DEFAULT_ULTRA_SCENES = [
-  "Легаси-археология",
-  "Каскадный отказ",
-  "Триумф после долгого дебага",
-] as const;
-const FEATURE_STATE_VALUES = ["enabled", "disabled", "selected"] as const;
-const SOURCE_PRESET_VALUES = ["tier-defaults", "custom"] as const;
-const SETTINGS_SECTIONS = ["general", "skill", "dictionary", "scenes"] as const;
-const SETTINGS_SECTION_LABELS: Record<SettingsSection, string> = {
-  general: "General",
-  skill: "Skill",
-  dictionary: "Dictionary",
-  scenes: "Scenes",
-};
-const NON_OPTIONAL_DICTIONARY_PREFIXES = ["Чего в словаре нет"] as const;
-const DICTIONARY_DESCRIPTIONS: Record<string, string> = {
-  "Состояния и статусы": "Лексика для оценки состояния проекта: от нормальной работы до полного отказа.",
-  "Действия": "Глаголы и выражения для работы, ошибок, исправлений, ожидания и бесполезной возни.",
-  "Оценки и количества": "Оценки масштаба, количества, уверенности и значимости.",
-  "Сущности": "Названия для кода, артефактов, процессов и прочих технических сущностей.",
-};
-
-type FeatureState = (typeof FEATURE_STATE_VALUES)[number];
-type SourcePreset = (typeof SOURCE_PRESET_VALUES)[number];
-type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
-type StoredSettings = {
-  tier: StoredTier;
-  selectedSections?: string[];
-};
-type SettingsItem = {
-  id: string;
-  label: string;
-  description?: string;
-  currentValue: string;
-  values: string[];
-};
-type SourceOption = {
-  id: string;
-  section: Exclude<SettingsSection, "general">;
-  label: string;
-  description: string;
-  content: string;
-};
-type StyleSource = {
-  common: string[];
-  tiers: Record<Tier, string>;
-  options: SourceOption[];
-};
-
-const WORKING_MINIMUM_OVERLAPS: Record<string, string> = {
-  [sourceId("slovar", "Состояния и статусы")]: "Состояние:",
-  [sourceId("slovar", "Действия")]: "Действия:",
-  [sourceId("slovar", "Оценки и количества")]: "Связки и оценки:",
-  [sourceId("slovar", "Сущности")]: "Сущности:",
-};
-const WORKING_MINIMUM_LABELS = [...Object.values(WORKING_MINIMUM_OVERLAPS), "Присказки"];
-
-function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isTier(value: unknown): value is Tier {
-  return typeof value === "string" && (TIERS as readonly string[]).includes(value);
-}
-
-function extractHeadingSection(markdown: string, depth: number, heading: string, source: string): string {
-  const lines = markdown.split("\n");
-  const marker = `${"#".repeat(depth)} ${heading}`;
-  const start = lines.findIndex((line) => line.trimEnd() === marker);
-  if (start === -1) throw new Error(`Missing ${source} section: ${heading}`);
-
-  const next = lines.findIndex((line, index) => {
-    if (index <= start) return false;
-    const match = line.match(/^(#{1,6})\s/);
-    return match !== null && match[1].length <= depth;
-  });
-  const body = lines.slice(start + 1, next === -1 ? undefined : next).join("\n").trim();
-  if (!body) throw new Error(`Empty ${source} section: ${heading}`);
-  return `${marker}\n\n${body}`;
-}
-
-function extractSkillSection(markdown: string, heading: string): string {
-  return extractHeadingSection(markdown, 2, heading, "SKILL.md");
-}
-
-function headingsAtDepth(markdown: string, depth: number): string[] {
-  const prefix = `${"#".repeat(depth)} `;
-  return markdown
-    .split("\n")
-    .filter((line) => line.startsWith(prefix) && !line.startsWith(`${prefix}#`))
-    .map((line) => line.slice(prefix.length).trim())
-    .filter(Boolean);
-}
-
-function requiredHeadingWithPrefix(markdown: string, depth: number, prefix: string): string {
-  const heading = headingsAtDepth(markdown, depth).find((candidate) => candidate.startsWith(prefix));
-  if (!heading) throw new Error(`Missing heading beginning with: ${prefix}`);
-  return heading;
-}
-
-function sourceId(source: "skill" | "slovar" | "sceny", heading: string): string {
-  return `${source}:${heading}`;
-}
-
-function plainMarkdownText(text: string): string {
-  return text
-    .replace(/^>\s?/gm, "")
-    .replace(/^[-*]\s+/gm, "")
-    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function firstContentBlock(content: string): string {
-  const lines = content.split("\n").slice(1);
-  const start = lines.findIndex((line) => line.trim() !== "");
-  if (start === -1) return "";
-  const endOffset = lines.slice(start).findIndex((line) => line.trim() === "");
-  const end = endOffset === -1 ? lines.length : start + endOffset;
-  return plainMarkdownText(lines.slice(start, end).join("\n"));
-}
-
-function sourceOption(
-  source: "skill" | "slovar" | "sceny",
-  heading: string,
-  content: string,
-): SourceOption {
-  return {
-    id: sourceId(source, heading),
-    section: source === "skill" ? "skill" : source === "slovar" ? "dictionary" : "scenes",
-    label: heading,
-    description: source === "slovar"
-      ? DICTIONARY_DESCRIPTIONS[heading] ?? firstContentBlock(content)
-      : firstContentBlock(content),
-    content,
-  };
-}
-
-function extractTierPolicy(levels: string, tier: Tier): string {
-  const lines = levels.split("\n");
-  const tableRow = lines.find((line) => line.startsWith(`| **${tier}** |`));
-  if (!tableRow) throw new Error(`Missing SKILL.md tier table row: ${tier}`);
-
-  const examples: string[] = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!lines[index].startsWith(`- ${tier}:`)) continue;
-    const block = [lines[index]];
-    while (index + 1 < lines.length && /^\s{2,}\S/.test(lines[index + 1])) {
-      block.push(lines[index + 1]);
-      index += 1;
-    }
-    examples.push(block.join("\n"));
-  }
-  if (examples.length === 0) throw new Error(`Missing SKILL.md tier examples: ${tier}`);
-
-  return [`## Уровень ${tier}`, tableRow, ...examples].join("\n\n");
-}
-
-export async function loadStyleSource(): Promise<StyleSource> {
-  const [skill, slovar, scenes] = await Promise.all([
-    readFile(SKILL_PATH, "utf8"),
-    readFile(SLOVAR_PATH, "utf8"),
-    readFile(SCENES_PATH, "utf8"),
-  ]);
-  const levels = extractSkillSection(skill, "Уровни");
-  const nonOptionalDictionaryHeading = requiredHeadingWithPrefix(
-    slovar,
-    2,
-    NON_OPTIONAL_DICTIONARY_PREFIXES[0],
-  );
-  const common = [
-    ...CORE_SKILL_SECTIONS.map((heading) => extractSkillSection(skill, heading)),
-    extractHeadingSection(slovar, 2, nonOptionalDictionaryHeading, "slovar.md"),
-    SCENE_FRAMING,
-  ];
-  const options = [
-    ...OPTIONAL_SKILL_SECTIONS.map((heading) =>
-      sourceOption("skill", heading, extractSkillSection(skill, heading))
-    ),
-    ...headingsAtDepth(slovar, 2)
-      .filter((heading) =>
-        !NON_OPTIONAL_DICTIONARY_PREFIXES.some((prefix) => heading.startsWith(prefix))
-      )
-      .map((heading) =>
-        sourceOption("slovar", heading, extractHeadingSection(slovar, 2, heading, "slovar.md"))
-      ),
-    ...headingsAtDepth(scenes, 3).map((heading) =>
-      sourceOption("sceny", heading, extractHeadingSection(scenes, 3, heading, "sceny.md"))
-    ),
-  ];
-
-  const source: StyleSource = {
-    common,
-    options,
-    tiers: Object.fromEntries(
-      TIERS.map((tier) => [tier, extractTierPolicy(levels, tier)]),
-    ) as Record<Tier, string>,
-  };
-  assertDefaultSections(source);
-  return source;
-}
-
-function defaultSectionIds(tier: StoredTier): string[] {
-  if (tier === "lite" || tier === "normal") return [];
-  const full = OPTIONAL_SKILL_SECTIONS.map((heading) => sourceId("skill", heading));
-  if (tier === "full") return full;
-  return [
-    ...full,
-    sourceId("slovar", "Образность: восклицания, звукопись, присказки"),
-    ...DEFAULT_ULTRA_SCENES.map((heading) => sourceId("sceny", heading)),
-  ];
-}
-
-function assertDefaultSections(source: StyleSource): void {
-  const known = new Set(source.options.map((option) => option.id));
-  const required = new Set([
-    ...defaultSectionIds("full"),
-    ...defaultSectionIds("ultra"),
-  ]);
-  const missing = [...required].filter((id) => !known.has(id));
-  if (missing.length > 0) throw new Error(`Missing default policy sections: ${missing.join(", ")}`);
-}
-
-function selectedSectionIds(settings: StoredSettings, source: StyleSource): string[] {
-  const selected = new Set(settings.selectedSections ?? defaultSectionIds(settings.tier));
-  return source.options.filter((option) => selected.has(option.id)).map((option) => option.id);
-}
-
-function effectiveSectionIds(settings: StoredSettings, source: StyleSource): string[] {
-  return settings.tier === "normal" ? [] : selectedSectionIds(settings, source);
-}
-
-function normalizeStoredSettings(settings: StoredSettings, source: StyleSource): StoredSettings {
-  if (settings.selectedSections === undefined) return settings;
-  return { ...settings, selectedSections: selectedSectionIds(settings, source) };
-}
-
-function sameStoredSettings(left: StoredSettings, right: StoredSettings): boolean {
-  if (left.tier !== right.tier) return false;
-  if (left.selectedSections === undefined || right.selectedSections === undefined) {
-    return left.selectedSections === right.selectedSections;
-  }
-  return left.selectedSections.length === right.selectedSections.length &&
-    left.selectedSections.every((id, index) => id === right.selectedSections?.[index]);
-}
-
-function fullSettingsPatch(settings: StoredSettings): SettingsPatch {
-  return {
-    tier: settings.tier,
-    selectedSections: settings.selectedSections === undefined ? null : settings.selectedSections,
-  };
-}
-
-function removeWorkingMinimumOverlaps(content: string, selected: Set<string>): string {
-  const removedLabels = new Set(
-    Object.entries(WORKING_MINIMUM_OVERLAPS)
-      .filter(([id]) => selected.has(id))
-      .map(([, label]) => label),
-  );
-  if (removedLabels.size === 0) return content;
-
-  const lines = content.split("\n");
-  const result: string[] = [];
-  let skipping = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const label = WORKING_MINIMUM_LABELS.find((candidate) =>
-      candidate === "Присказки" ? trimmed.startsWith("Присказки") : trimmed === candidate
-    );
-    if (label) skipping = removedLabels.has(label);
-    if (!skipping) result.push(line);
-  }
-  return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-export function selectTierVariant(content: string, tier: Tier): string {
-  const lines = content.split("\n");
-  const result: string[] = [];
-  let skippingVariant = false;
-  let pendingBlankLines: string[] = [];
-
-  for (const line of lines) {
-    const variant = line.match(/^- (lite|full|ultra):/);
-    if (variant) {
-      pendingBlankLines = [];
-      skippingVariant = variant[1] !== tier;
-      if (!skippingVariant) result.push(line);
-      continue;
-    }
-    if (skippingVariant) {
-      if (line.trim() === "") {
-        pendingBlankLines.push(line);
-        continue;
-      }
-      if (/^\s{2,}\S/.test(line)) {
-        pendingBlankLines = [];
-        continue;
-      }
-      result.push(...pendingBlankLines);
-      pendingBlankLines = [];
-      skippingVariant = false;
-    }
-    result.push(line);
-  }
-  return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function compileSelectedOption(option: SourceOption, selected: Set<string>, tier: Tier): string {
-  let content = option.content;
-  if (option.id === sourceId("skill", "Словарь (рабочий минимум)")) {
-    content = removeWorkingMinimumOverlaps(content, selected);
-  }
-  return selectTierVariant(content, tier);
-}
-
-export function buildStylePolicy(settings: StoredSettings, source: StyleSource): string | undefined {
-  const tier = settings.tier;
-  if (tier === "normal") return undefined;
-  const selected = new Set(effectiveSectionIds(settings, source));
-  return [
-    ...source.common,
-    ...source.options
-      .filter((option) => selected.has(option.id))
-      .map((option) => compileSelectedOption(option, selected, tier)),
-    source.tiers[tier],
-  ].filter(Boolean).join("\n\n");
-}
-
-function managedStyleBlock(stylePrompt: string | undefined): string | undefined {
-  return stylePrompt ? `${PROMPT_START}\n${stylePrompt}\n${PROMPT_END}` : undefined;
-}
-
-export function stripManagedStyleBlocks(prompt: string): string {
-  const openStarts: number[] = [];
-  const ranges: Array<{ start: number; end: number }> = [];
-  let cursor = 0;
-
-  while (cursor < prompt.length) {
-    const start = prompt.indexOf(PROMPT_START, cursor);
-    const end = prompt.indexOf(PROMPT_END, cursor);
-    if (start === -1 && end === -1) break;
-
-    if (start !== -1 && (end === -1 || start < end)) {
-      openStarts.push(start);
-      cursor = start + PROMPT_START.length;
-      continue;
-    }
-
-    if (openStarts.length > 0) {
-      ranges.push({
-        start: openStarts.pop()!,
-        end: end + PROMPT_END.length,
-      });
-    }
-    cursor = end + PROMPT_END.length;
-  }
-
-  if (ranges.length === 0) return prompt;
-
-  const merged = ranges
-    .sort((left, right) => left.start - right.start)
-    .reduce<Array<{ start: number; end: number }>>((result, range) => {
-      const previous = result.at(-1);
-      if (previous && range.start <= previous.end) {
-        previous.end = Math.max(previous.end, range.end);
-      } else {
-        result.push({ ...range });
-      }
-      return result;
-    }, []);
-  const expanded = merged
-    .map((range) => {
-      let { start, end } = range;
-      while (start > 0 && prompt[start - 1] === "\n") start -= 1;
-      while (end < prompt.length && prompt[end] === "\n") end += 1;
-      return { start, end };
-    })
-    .reduce<Array<{ start: number; end: number }>>((result, range) => {
-      const previous = result.at(-1);
-      if (previous && range.start <= previous.end) {
-        previous.end = Math.max(previous.end, range.end);
-      } else {
-        result.push({ ...range });
-      }
-      return result;
-    }, []);
-
-  let result = "";
-  cursor = 0;
-  for (const range of expanded) {
-    result += prompt.slice(cursor, range.start);
-    if (result.length > 0 && range.end < prompt.length) result += "\n\n";
-    cursor = range.end;
-  }
-  result += prompt.slice(cursor);
-  return result;
-}
-
-export function placeStylePromptAtAppendBoundary(
-  basePrompt: string,
-  appendSystemPrompt: string | undefined,
-  stylePrompt: string | undefined,
-): string {
-  const cleanBase = stripManagedStyleBlocks(basePrompt);
-  const block = managedStyleBlock(stylePrompt);
-  if (!block) return cleanBase;
-
-  const append = appendSystemPrompt?.trim();
-  const appendIndex = append ? cleanBase.lastIndexOf(append) : -1;
-  if (append && appendIndex >= 0) {
-    const before = cleanBase.slice(0, appendIndex).replace(/\n+$/, "");
-    const after = cleanBase.slice(appendIndex).replace(/^\n+/, "");
-    return [before, block, after].filter(Boolean).join("\n\n");
-  }
-  return cleanBase ? `${cleanBase}\n\n${block}` : block;
-}
-
-async function readStoredSettings(): Promise<StoredSettings> {
-  try {
-    const root: unknown = JSON.parse(await readFile(SETTINGS_PATH, "utf8"));
-    if (!isJsonObject(root) || !isJsonObject(root[SETTINGS_KEY])) {
-      return { tier: "normal" };
-    }
-
-    const record = root[SETTINGS_KEY];
-    const rawTier = record.tier;
-    const tier = rawTier === "normal" || isTier(rawTier) ? rawTier : "normal";
-    const selectedSections = Array.isArray(record.selectedSections)
-      ? [...new Set(record.selectedSections.filter((value): value is string => typeof value === "string"))]
-      : undefined;
-    return selectedSections === undefined ? { tier } : { tier, selectedSections };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) {
-      return { tier: "normal" };
-    }
-    throw error;
-  }
-}
-
-type SettingsPatch = {
-  tier?: StoredTier;
-  selectedSections?: string[] | null;
-};
-
-function applySettingsPatch(settings: StoredSettings, patch: SettingsPatch): StoredSettings {
-  const next: StoredSettings = {
-    ...settings,
-    tier: patch.tier ?? settings.tier,
-  };
-  if (patch.selectedSections === null) {
-    delete next.selectedSections;
-  } else if (patch.selectedSections !== undefined) {
-    next.selectedSections = [...new Set(patch.selectedSections)];
-  }
-  return next;
-}
-
-function sourceSettingId(id: string): string {
-  return `source:${id}`;
-}
-
-function sourceIdFromSetting(id: string): string | undefined {
-  return id.startsWith("source:") ? id.slice("source:".length) : undefined;
-}
-
-function buildSettingsItems(
-  section: SettingsSection,
-  settings: StoredSettings,
-  source: StyleSource,
-): SettingsItem[] {
-  if (section === "general") {
-    const preset: SourcePreset = settings.selectedSections === undefined ? "tier-defaults" : "custom";
-    return [
-      {
-        id: "tier",
-        label: "Mode",
-        description: "Response style and default source selection.",
-        currentValue: settings.tier,
-        values: ["normal", ...TIERS],
-      },
-      {
-        id: "sourcePreset",
-        label: "Source preset",
-        description: "Follow the selected tier defaults or keep a custom section set.",
-        currentValue: preset,
-        values: [...SOURCE_PRESET_VALUES],
-      },
-    ];
-  }
-
-  const active = new Set(effectiveSectionIds(settings, source));
-  const selected = new Set(selectedSectionIds(settings, source));
-  return source.options
-    .filter((option) => option.section === section)
-    .map((option) => {
-      const currentValue = active.has(option.id)
-        ? "enabled"
-        : selected.has(option.id)
-          ? "selected"
-          : "disabled";
-      const values = settings.tier === "normal"
-        ? currentValue === "selected"
-          ? ["selected", "disabled"]
-          : ["disabled", "selected"]
-        : ["enabled", "disabled"];
-      return {
-        id: sourceSettingId(option.id),
-        label: option.label,
-        description: option.description,
-        currentValue,
-        values,
-      };
-    });
-}
-
-function adjacentSettingsSection(
-  section: SettingsSection,
-  direction: "forward" | "backward",
-): SettingsSection {
-  const index = SETTINGS_SECTIONS.indexOf(section);
-  const offset = direction === "forward" ? 1 : -1;
-  return SETTINGS_SECTIONS[(index + offset + SETTINGS_SECTIONS.length) % SETTINGS_SECTIONS.length];
-}
-
-function renderSettingsTabs(
-  section: SettingsSection,
-  theme: ExtensionContext["ui"]["theme"],
-  width: number,
-): string {
-  const tabs = SETTINGS_SECTIONS.map((candidate) => {
-    const label = SETTINGS_SECTION_LABELS[candidate];
-    return candidate === section
-      ? theme.fg("accent", theme.bold(label))
-      : theme.fg("muted", label);
-  });
-  const full = `  ${tabs.join(theme.fg("muted", " / "))}`;
-  if (visibleWidth(full) <= width) return full;
-  const index = SETTINGS_SECTIONS.indexOf(section);
-  return `  ${theme.fg("accent", theme.bold(SETTINGS_SECTION_LABELS[section]))} ${theme.fg("dim", `(${index + 1}/${SETTINGS_SECTIONS.length})`)}`;
-}
-
-function wrapToWidth(text: string, width: number): string[] {
-  return wrapTextWithAnsi(text, Math.max(1, width));
-}
-
-function padToWidth(text: string, width: number): string {
-  return `${text}${" ".repeat(Math.max(0, width - visibleWidth(text)))}`;
-}
-
-function settingsLayout(
-  items: SettingsItem[],
-  width: number,
-): {
-  inline: boolean;
-  labelWidth: number;
-  maxLabelWidth: number;
-  rowHeights: number[];
-  valueWidth: number;
-} {
-  const valueWidth = Math.max(...items.map((item) => visibleWidth(item.currentValue)));
-  const maxLabelWidth = Math.max(...items.map((item) => visibleWidth(item.label)));
-  const inlineLabelWidth = width - 2 - 2 - valueWidth;
-  const inline = inlineLabelWidth >= 8;
-  const labelWidth = inline
-    ? Math.min(maxLabelWidth, inlineLabelWidth)
-    : Math.max(1, width - 2);
-  const rowHeights = items.map((item) => {
-    const labelRows = wrapToWidth(item.label, labelWidth).length;
-    return inline ? labelRows : labelRows + 1;
-  });
-  return { inline, labelWidth, maxLabelWidth, rowHeights, valueWidth };
-}
-
-function visibleSettingsRange(
-  rowHeights: number[],
-  selectedIndex: number,
-  rowBudget: number,
-): { start: number; end: number } {
-  if (rowHeights.length === 0) return { start: 0, end: 0 };
-  const selected = Math.min(Math.max(0, selectedIndex), rowHeights.length - 1);
-  let start = selected;
-  let end = selected + 1;
-  let used = rowHeights[selected];
-
-  while (true) {
-    let expanded = false;
-    if (start > 0 && used + rowHeights[start - 1] <= rowBudget) {
-      start -= 1;
-      used += rowHeights[start];
-      expanded = true;
-    }
-    if (end < rowHeights.length && used + rowHeights[end] <= rowBudget) {
-      used += rowHeights[end];
-      end += 1;
-      expanded = true;
-    }
-    if (!expanded) break;
-  }
-  return { start, end };
-}
-
-function renderSettingValue(
-  value: string,
-  theme: ExtensionContext["ui"]["theme"],
-): string {
-  if (value === "enabled") return theme.fg("success", theme.bold(value));
-  if (value === "selected") return theme.fg("accent", theme.bold(value));
-  if (value === "disabled" || value === "normal") return theme.fg("dim", value);
-  if (value === "custom") return theme.fg("warning", theme.bold(value));
-  return theme.fg("accent", theme.bold(value));
-}
-
-function paintSettingsRow(
-  line: string,
-  active: boolean,
-  width: number,
-  theme: ExtensionContext["ui"]["theme"],
-): string {
-  return active ? theme.bg("selectedBg", padToWidth(line, width)) : line;
-}
-
-function renderHelpLine(
-  line: string,
-  theme: ExtensionContext["ui"]["theme"],
-): string {
-  return line
-    .split(/(Enter\/Space|Tab or reverse Tab|Esc)/)
-    .map((part) =>
-      /^(Enter\/Space|Tab or reverse Tab|Esc)$/.test(part)
-        ? theme.fg("accent", theme.bold(part))
-        : theme.fg("dim", part)
-    )
-    .join("");
-}
-
-function renderResponsiveSettings(
-  items: SettingsItem[],
-  selectedIndex: number,
-  width: number,
-  height: number,
-  theme: ExtensionContext["ui"]["theme"],
-): string[] {
-  if (items.length === 0) return [theme.fg("muted", "  No settings in this section.")];
-
-  const selected = Math.min(Math.max(0, selectedIndex), items.length - 1);
-  const { inline, labelWidth, rowHeights } = settingsLayout(items, width);
-  const description = items[selected]?.description;
-  const descriptionLines = description
-    ? wrapToWidth(description, Math.max(1, width - 4))
-    : [];
-  const helpLines = wrapToWidth(
-    "Enter/Space to change / Tab or reverse Tab to switch sections / Esc to close",
-    Math.max(1, width - 2),
-  );
-  const contentHeight = Math.max(1, height - 4);
-  const selectedRows = rowHeights[selected];
-  const helpBlockRows = 1 + helpLines.length;
-  const showHelp = contentHeight >= selectedRows + helpBlockRows;
-  const descriptionBlockRows = descriptionLines.length > 0 ? 1 + descriptionLines.length : 0;
-  const showDescription = descriptionBlockRows > 0 &&
-    contentHeight >= selectedRows + (showHelp ? helpBlockRows : 0) + descriptionBlockRows;
-  const fixedRows = (showHelp ? helpBlockRows : 0) + (showDescription ? descriptionBlockRows : 0);
-  const allItemRows = rowHeights.reduce((sum, rows) => sum + rows, 0);
-  const showIndicator = allItemRows > contentHeight - fixedRows;
-  const rowBudget = Math.max(
-    selectedRows,
-    contentHeight - fixedRows - (showIndicator ? 1 : 0),
-  );
-  const { start, end } = visibleSettingsRange(rowHeights, selected, rowBudget);
-  const window = items.slice(start, end);
-  const lines: string[] = [];
-
-  for (const [windowIndex, item] of window.entries()) {
-    const itemIndex = start + windowIndex;
-    const active = itemIndex === selected;
-    const labelLines = wrapToWidth(item.label, labelWidth);
-    const cursor = active ? theme.fg("accent", "→ ") : "  ";
-    const renderLabel = (label: string) => active
-      ? theme.fg("accent", theme.bold(label))
-      : theme.fg("text", label);
-    const pushRow = (line: string) => lines.push(paintSettingsRow(line, active, width, theme));
-
-    if (inline) {
-      pushRow(
-        `${cursor}${renderLabel(padToWidth(labelLines[0] ?? "", labelWidth))}  ${renderSettingValue(item.currentValue, theme)}`,
-      );
-      for (const continuation of labelLines.slice(1)) {
-        pushRow(`  ${renderLabel(continuation)}`);
-      }
-    } else {
-      pushRow(`${cursor}${renderLabel(labelLines[0] ?? "")}`);
-      for (const continuation of labelLines.slice(1)) pushRow(`  ${renderLabel(continuation)}`);
-      pushRow(`  ${renderSettingValue(item.currentValue, theme)}`);
-    }
-  }
-
-  if (start > 0 || end < items.length) {
-    lines.push(
-      `  ${theme.fg("dim", "(")}${theme.fg("accent", theme.bold(String(selected + 1)))}${theme.fg("dim", `/${items.length})`)}`,
-    );
-  }
-  if (showDescription) {
-    lines.push("");
-    lines.push(
-      ...descriptionLines.map((line, index) =>
-        `${index === 0 ? theme.fg("accent", "  › ") : "    "}${theme.fg("text", line)}`
-      ),
-    );
-  }
-  if (showHelp) {
-    lines.push("");
-    lines.push(...helpLines.map((line) => renderHelpLine(`  ${line}`, theme)));
-  }
-  return lines;
-}
-
-export function fitSettingsRender(lines: string[], width: number, height: number): string[] {
-  const safeWidth = Math.max(0, width);
-  const safeHeight = Math.max(0, height);
-  return lines
-    .slice(0, safeHeight)
-    .map((line) => truncateToWidth(line, safeWidth, ""));
-}
-
-export function mergeStoredSettings(root: JsonObject, patch: SettingsPatch): JsonObject {
-  const current = isJsonObject(root[SETTINGS_KEY]) ? { ...root[SETTINGS_KEY] } : {};
-  if (patch.tier !== undefined) current.tier = patch.tier;
-  if (patch.selectedSections === null) {
-    delete current.selectedSections;
-  } else if (patch.selectedSections !== undefined) {
-    current.selectedSections = [...new Set(patch.selectedSections)];
-  }
-  return { ...root, [SETTINGS_KEY]: current };
-}
-
-async function saveStoredSettings(patch: SettingsPatch): Promise<void> {
-  await withFileMutationQueue(SETTINGS_PATH, async () => {
-    await mkdir(dirname(SETTINGS_PATH), { recursive: true });
-
-    let root: JsonObject = {};
-    let mode = 0o600;
-    try {
-      mode = (await stat(SETTINGS_PATH)).mode & 0o777;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(await readFile(SETTINGS_PATH, "utf8"));
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-        const backup = `${SETTINGS_PATH}.corrupt-${Date.now()}-${randomUUID()}`;
-        await rename(SETTINGS_PATH, backup);
-      }
-      if (parsed !== undefined) {
-        if (isJsonObject(parsed)) {
-          root = parsed;
-        } else {
-          const backup = `${SETTINGS_PATH}.corrupt-${Date.now()}-${randomUUID()}`;
-          await rename(SETTINGS_PATH, backup);
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    const nextRoot = mergeStoredSettings(root, patch);
-    const temporary = `${SETTINGS_PATH}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      const handle = await open(temporary, "wx", mode);
-      try {
-        await handle.writeFile(`${JSON.stringify(nextRoot, null, 2)}\n`, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await rename(temporary, SETTINGS_PATH);
-    } catch (error) {
-      await rm(temporary, { force: true }).catch(() => undefined);
-      throw error;
-    }
-  });
-}
 
 export default async function pohuyExtension(pi: ExtensionAPI) {
   let styleSource: StyleSource | undefined;
@@ -839,10 +50,12 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
   };
   const enqueueSettingsMutation = (patch: SettingsPatch): Promise<StoredSettings> =>
     enqueueSettingsOperation(async () => {
+      const loaded = await readStoredSettings();
+      const current = styleSource ? normalizeStoredSettings(loaded, styleSource) : loaded;
       const next = styleSource
-        ? normalizeStoredSettings(applySettingsPatch(settings, patch), styleSource)
-        : applySettingsPatch(settings, patch);
-      await saveStoredSettings(fullSettingsPatch(next));
+        ? normalizeStoredSettings(applySettingsPatch(current, patch), styleSource)
+        : applySettingsPatch(current, patch);
+      await saveStoredSettings(diffStoredSettings(loaded, next));
       settings = next;
       return settings;
     });
@@ -850,7 +63,7 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
     enqueueSettingsOperation(async () => {
       const loaded = await readStoredSettings();
       const next = styleSource ? normalizeStoredSettings(loaded, styleSource) : loaded;
-      if (!sameStoredSettings(loaded, next)) await saveStoredSettings(fullSettingsPatch(next));
+      if (!sameStoredSettings(loaded, next)) await saveStoredSettings(diffStoredSettings(loaded, next));
       settings = next;
       return settings;
     });
@@ -872,21 +85,21 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
       try {
         styleSource = await loadStyleSource();
       } catch (error) {
-        failures.push(`sources: ${String(error)}`);
+        failures.push(`источники: ${String(error)}`);
       }
     }
     try {
       await enqueueSettingsReload();
     } catch (error) {
-      failures.push(`settings: ${String(error)}`);
+      failures.push(`настройки: ${String(error)}`);
     }
     if (failures.length > 0 && ctx.hasUI) {
-      ctx.ui.notify(`Could not initialize Pohuy (${failures.join("; ")})`, "error");
+      ctx.ui.notify(`Не удалось запустить Pohuy. ${failures.join(". ")}`, "error");
     }
   });
 
   pi.registerCommand("pohuy", {
-    description: "Configure Pohuy response style and prompt sources",
+    description: "Настроить стиль ответов, словарь и сцены Pohuy",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const options = [...TIERS, "normal"];
       const value = prefix.trim().toLowerCase();
@@ -906,144 +119,27 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
         try {
           styleSource ??= await loadStyleSource();
         } catch (error) {
-          if (ctx.hasUI) ctx.ui.notify(`Could not load Pohuy sources: ${String(error)}`, "error");
+          if (ctx.hasUI) ctx.ui.notify(`Не удалось загрузить источники Pohuy: ${String(error)}`, "error");
           return;
         }
         const source = styleSource;
         if (!ctx.hasUI || ctx.mode !== "tui") {
-          if (ctx.hasUI) ctx.ui.notify("Pohuy settings UI is available only in TUI mode.", "warning");
+          if (ctx.hasUI) ctx.ui.notify("Меню настроек Pohuy доступно только в режиме TUI.", "warning");
           return;
         }
 
-        await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-          let applying = false;
-          let closeRequested = false;
-          let activeSection: SettingsSection = "general";
-          const selectedIndexes: Record<SettingsSection, number> = {
-            general: 0,
-            skill: 0,
-            dictionary: 0,
-            scenes: 0,
-          };
-          const currentItems = () => buildSettingsItems(activeSection, settings, source);
-          const clampSelection = () => {
-            const items = currentItems();
-            selectedIndexes[activeSection] = Math.min(
-              Math.max(0, selectedIndexes[activeSection]),
-              Math.max(0, items.length - 1),
-            );
-          };
-          const switchSection = (direction: "forward" | "backward") => {
-            activeSection = adjacentSettingsSection(activeSection, direction);
-            clampSelection();
-            tui.requestRender();
-          };
-          const applyCurrentSetting = () => {
-            if (applying) return;
-            const items = currentItems();
-            const item = items[selectedIndexes[activeSection]];
-            if (!item || item.values.length < 2) return;
-            const valueIndex = item.values.indexOf(item.currentValue);
-            const newValue = item.values[(Math.max(0, valueIndex) + 1) % item.values.length];
-            let patch: SettingsPatch | undefined;
-            let notification: string | undefined;
-
-            if (item.id === "tier" && (newValue === "normal" || isTier(newValue))) {
-              patch = { tier: newValue };
-              notification = `Pohuy mode: ${newValue}`;
-            } else if (
-              item.id === "sourcePreset" &&
-              SOURCE_PRESET_VALUES.includes(newValue as SourcePreset)
-            ) {
-              patch = newValue === "tier-defaults"
-                ? { selectedSections: null }
-                : { selectedSections: selectedSectionIds(settings, source) };
-              notification = `Pohuy source preset: ${newValue}`;
-            } else {
-              const optionId = sourceIdFromSetting(item.id);
-              const option = source.options.find((candidate) => candidate.id === optionId);
-              if (option && FEATURE_STATE_VALUES.includes(newValue as FeatureState)) {
-                const selected = new Set(selectedSectionIds(settings, source));
-                if (newValue === "enabled" || newValue === "selected") selected.add(option.id);
-                else selected.delete(option.id);
-                patch = { selectedSections: [...selected] };
-                notification = `${option.label}: ${newValue}`;
-              }
-            }
-            if (!patch) return;
-
-            applying = true;
-            void enqueueSettingsMutation(patch)
-              .then(() => {
-                clampSelection();
-                ctx.ui.notify(notification ?? "Pohuy settings updated.", "info");
-              })
-              .catch((error) => {
-                ctx.ui.notify(`Could not update Pohuy settings: ${String(error)}`, "error");
-              })
-              .finally(() => {
-                applying = false;
-                if (closeRequested) done(undefined);
-                else tui.requestRender();
-              });
-          };
-
-          return {
-            render(width: number) {
-              const height = tui.terminal.rows;
-              const border = theme.fg("border", "─".repeat(Math.max(0, width)));
-              return fitSettingsRender([
-                border,
-                renderSettingsTabs(activeSection, theme, width),
-                border,
-                ...renderResponsiveSettings(
-                  currentItems(),
-                  selectedIndexes[activeSection],
-                  width,
-                  height,
-                  theme,
-                ),
-                border,
-              ], width, height);
-            },
-            invalidate() {},
-            handleInput(data: string) {
-              if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-                if (applying) closeRequested = true;
-                else done(undefined);
-                return;
-              }
-              if (applying || closeRequested) return;
-              if (matchesKey(data, Key.tab)) {
-                switchSection("forward");
-                return;
-              }
-              if (matchesKey(data, Key.shift("tab"))) {
-                switchSection("backward");
-                return;
-              }
-              const items = currentItems();
-              if (matchesKey(data, Key.up)) {
-                selectedIndexes[activeSection] = Math.max(0, selectedIndexes[activeSection] - 1);
-              } else if (matchesKey(data, Key.down)) {
-                selectedIndexes[activeSection] = Math.min(
-                  Math.max(0, items.length - 1),
-                  selectedIndexes[activeSection] + 1,
-                );
-              } else if (matchesKey(data, Key.home)) {
-                selectedIndexes[activeSection] = 0;
-              } else if (matchesKey(data, Key.end)) {
-                selectedIndexes[activeSection] = Math.max(0, items.length - 1);
-              } else if (matchesKey(data, Key.enter) || matchesKey(data, Key.space)) {
-                applyCurrentSetting();
-                return;
-              } else {
-                return;
-              }
-              tui.requestRender();
-            },
-          };
-        });
+        await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+          createStyleSettingsComponent({
+            source,
+            getSettings: () => settings,
+            mutate: async (patch) => { await enqueueSettingsMutation(patch); },
+            tui,
+            theme,
+            border: theme.getThinkingBorderColor(ctx.thinkingLevel ?? "off"),
+            done: () => done(undefined),
+            notify: (message, level) => ctx.ui.notify(message, level),
+          })
+        );
         return;
       }
 
@@ -1058,13 +154,13 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
         if (tier !== "normal") styleSource ??= await loadStyleSource();
         await enqueueSettingsMutation({ tier });
       } catch (error) {
-        if (ctx.hasUI) ctx.ui.notify(`Could not save Pohuy settings: ${String(error)}`, "error");
+        if (ctx.hasUI) ctx.ui.notify(`Не удалось сохранить настройки Pohuy: ${String(error)}`, "error");
         return;
       }
 
       if (ctx.hasUI) {
         ctx.ui.notify(
-          tier === "normal" ? "Pohuy disabled. Normal mode restored." : `Pohuy enabled: ${tier}.`,
+          tier === "normal" ? "Pohuy отключён. Включён обычный режим." : `Pohuy включён, режим: ${tier}.`,
           "info",
         );
       }
@@ -1083,27 +179,21 @@ export default async function pohuyExtension(pi: ExtensionAPI) {
       await enqueueSettingsMutation({ tier });
       if (ctx.hasUI) {
         ctx.ui.notify(
-          tier === "normal" ? "Pohuy disabled. Normal mode restored." : "Pohuy enabled: full.",
+          tier === "normal" ? "Pohuy отключён. Включён обычный режим." : "Pohuy включён, режим: full.",
           "info",
         );
       }
     } catch (error) {
-      if (ctx.hasUI) ctx.ui.notify(`Could not save Pohuy settings: ${String(error)}`, "error");
+      if (ctx.hasUI) ctx.ui.notify(`Не удалось сохранить настройки Pohuy: ${String(error)}`, "error");
+      return { action: "continue" };
     }
 
     return { action: "handled" };
   });
 
   pi.on("before_agent_start", (event) => {
-    const policy = styleSource ? buildStylePolicy(settings, styleSource) : undefined;
-    const stylePrompt = policy && settings.tier !== "normal"
-      ? [
-        "Active session style: pohuy. Apply this policy only to natural-language assistant responses.",
-        policy,
-        `Selected tier: ${settings.tier}. Keep it until /pohuy or a documented natural-language switch changes it.`,
-        "Do not alter tool calls, tool results, structured output, or higher-priority instructions.",
-      ].join("\n\n")
-      : undefined;
+    if (!styleSource) return;
+    const stylePrompt = buildStylePrompt(settings, styleSource);
 
     const systemPrompt = placeStylePromptAtAppendBoundary(
       event.systemPrompt,
