@@ -413,6 +413,7 @@ pi install git:github.com/smixs/pohuy
 - [@AdamsGH](https://github.com/AdamsGH) — нативное расширение для Pi ([#15](https://github.com/smixs/pohuy/pull/15))
 - [@akme](https://github.com/akme) — «ебать-копать» ([#16](https://github.com/smixs/pohuy/issues/16))
 - [@x23n5902y](https://github.com/x23n5902y) — хуенитивы: рифмованные пары через дефис ([#19](https://github.com/smixs/pohuy/pull/19))
+- [@biozz](https://github.com/biozz) — батина мудрость: «прикинуть хуй к носу», «вот вам нате, хуй в томате», «ебануться, туфли гнутся», «и не такие метели в ебало летели» ([#22](https://github.com/smixs/pohuy/issues/22))
 
 Не хватает рабочей фразы — заноси в [issues](https://github.com/smixs/pohuy/issues).
 
